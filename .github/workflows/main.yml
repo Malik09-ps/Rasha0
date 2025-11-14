@@ -1,0 +1,101 @@
+name: RDP-Permanent
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */8 * * *'
+
+jobs:
+  maintain-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 480
+    steps:
+      - name: Check Existing RDP
+        run: |
+          $rdpEnabled = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections
+          $userExists = Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          
+          if ($rdpEnabled -eq 0 -and $userExists) {
+              Write-Host "✅ RDP already configured"
+              echo "REUSING_EXISTING=true" >> $env:GITHUB_ENV
+          } else {
+              Write-Host "🔄 Setting up new RDP"
+              echo "REUSING_EXISTING=false" >> $env:GITHUB_ENV
+          }
+
+      - name: Setup RDP (Only if needed)
+        if: env.REUSING_EXISTING == 'false'
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          
+          $password = "RDP@" + (Get-Date -Format "MMdd") + "!GitHub"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          if (Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDPUser"
+          }
+          
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ New RDP created"
+
+      - name: Reuse Existing
+        if: env.REUSING_EXISTING == 'true'
+        run: |
+          $password = "RDP@" + (Get-Date -Format "MMdd") + "!GitHub"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ Using existing RDP"
+
+      - name: Maintain Tailscale
+        run: |
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              Write-Host "✅ Tailscale installed"
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          } else {
+              Write-Host "📥 Installing Tailscale"
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+              $installerPath = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Remove-Item $installerPath -Force
+              Start-Sleep -Seconds 15
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-rdp
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          }
+
+      - name: Display Info
+        run: |
+          Write-Host "🎯 YOUR RDP - 30 DAYS"
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "User: RDPUser"
+          Write-Host "Password: $env:RDP_PASSWORD"
+
+      - name: Maintain Session
+        run: |
+          $startTime = Get-Date
+          $sessionEnd = $startTime.AddMinutes(470)
+          
+          while ((Get-Date) -lt $sessionEnd) {
+              $currentTime = Get-Date
+              $elapsed = $currentTime - $startTime
+              $days = [math]::Round($elapsed.TotalDays, 2)
+              
+              Write-Host "[$currentTime] RDP Active - Day $days/30 - IP: $env:TAILSCALE_IP"
+              
+              try {
+                  $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+                  if ($rdpService.Status -ne 'Running') {
+                      Start-Service -Name "TermService"
+                  }
+              } catch {
+                  Write-Host "Service check failed"
+              }
+              
+              Start-Sleep -Seconds 300
+          }

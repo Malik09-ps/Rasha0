@@ -7,7 +7,7 @@ on:
 jobs:
   maintain-rdp:
     runs-on: windows-latest
-    timeout-minutes: 480
+    timeout-minutes: 25
     steps:
       - name: Check Existing RDP
         run: |
